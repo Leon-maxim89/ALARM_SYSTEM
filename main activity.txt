@@ -1,0 +1,184 @@
+package com.example.myapplication;
+
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.TextView;
+
+import androidx.appcompat.app.AppCompatActivity;
+
+import org.eclipse.paho.client.mqttv3.IMqttActionListener;
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.IMqttToken;
+import org.eclipse.paho.client.mqttv3.MqttAsyncClient;
+import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.json.JSONObject;
+
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+
+public class MainActivity extends AppCompatActivity {
+
+    private static final String BROKER_URI = "tcp://broker.emqx.io:1883";
+
+    private static final String TOPIC_CMD   = "pico/demo/cmd";
+    private static final String TOPIC_STATE = "pico/demo/state";
+    private static final String TOPIC_EVENT = "pico/demo/event";
+
+    private TextView txtState;
+    private MqttAsyncClient client;
+
+    private void ui(String s) {
+        runOnUiThread(() -> txtState.setText(s));
+    }
+
+    private static String onOff(int v) { return v == 1 ? "ВКЛ" : "ВЫКЛ"; }
+    private static String yesNo(int v) { return v == 1 ? "ДА" : "НЕТ"; }
+
+    private String formatStateRu(String jsonStr) {
+        try {
+            JSONObject o = new JSONObject(jsonStr);
+            int armed  = o.optInt("armed", 0);
+            int sw     = o.optInt("switch", 0);
+            int led    = o.optInt("led", 0);
+            int motion = o.optInt("motion", 0);
+
+            return "Охрана: " + onOff(armed)
+                    + " | Тумблер: " + onOff(sw)
+                    + " | Движение: " + yesNo(motion)
+                    + " | Светодиод: " + onOff(led);
+        } catch (Exception e) {
+
+            return "Состояние: " + jsonStr;
+        }
+    }
+
+    private void connectMqtt() {
+        new Thread(() -> {
+            try {
+                if (client != null) {
+                    try { if (client.isConnected()) client.disconnect(); } catch (Exception ignored) {}
+                    try { client.close(); } catch (Exception ignored) {}
+                    client = null;
+                }
+
+                String clientId = "android-" + UUID.randomUUID();
+                client = new MqttAsyncClient(BROKER_URI, clientId, new MemoryPersistence());
+
+                client.setCallback(new MqttCallback() {
+                    @Override
+                    public void connectionLost(Throwable cause) {
+                        ui("Связь потеряна" + (cause != null ? (" — " + cause.getMessage()) : ""));
+                    }
+
+                    @Override
+                    public void messageArrived(String topic, MqttMessage message) {
+                        String payload = new String(message.getPayload(), StandardCharsets.UTF_8);
+
+                        if (TOPIC_STATE.equals(topic)) {
+                            ui(formatStateRu(payload));
+                        } else if (TOPIC_EVENT.equals(topic)) {
+
+                            try {
+                                JSONObject o = new JSONObject(payload);
+                                String ev = o.optString("event", payload);
+                                ui("Событие: " + ev);
+                            } catch (Exception e) {
+                                ui("Событие: " + payload);
+                            }
+                        } else {
+                            ui(topic + ": " + payload);
+                        }
+                    }
+
+                    @Override
+                    public void deliveryComplete(IMqttDeliveryToken token) {}
+                });
+
+                MqttConnectOptions opt = new MqttConnectOptions();
+                opt.setAutomaticReconnect(true);
+                opt.setCleanSession(true);
+                opt.setMqttVersion(MqttConnectOptions.MQTT_VERSION_3_1_1);
+
+                ui("Подключение...");
+
+                client.connect(opt, null, new IMqttActionListener() {
+                    @Override
+                    public void onSuccess(IMqttToken asyncActionToken) {
+                        ui("Подключено");
+                        try {
+                            client.subscribe(TOPIC_STATE, 0);
+                            client.subscribe(TOPIC_EVENT, 0);
+                            publishCmd("STATUS"); // запросить статус сразу
+                        } catch (MqttException e) {
+                            ui("Ошибка подписки: " + e.getMessage());
+                        }
+                    }
+
+                    @Override
+                    public void onFailure(IMqttToken asyncActionToken, Throwable exception) {
+                        ui("Ошибка подключения: " + (exception != null ? exception.getMessage() : "неизвестно"));
+                    }
+                });
+
+            } catch (Exception e) {
+                ui("Ошибка: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    private void publishCmd(String cmd) {
+        new Thread(() -> {
+            try {
+                if (client == null || !client.isConnected()) {
+                    ui("Нет подключения");
+                    return;
+                }
+                MqttMessage msg = new MqttMessage(cmd.getBytes(StandardCharsets.UTF_8));
+                msg.setQos(0);
+                msg.setRetained(false);
+                client.publish(TOPIC_CMD, msg);
+            } catch (Exception e) {
+                ui("Ошибка отправки: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+
+        txtState = findViewById(R.id.txtState);
+
+        Button btnConnect = findViewById(R.id.btnConnect);
+        Button btnArm     = findViewById(R.id.btnArm);
+        Button btnDisarm  = findViewById(R.id.btnDisarm);
+        Button btnTest    = findViewById(R.id.btnTest);
+        Button btnLedOn   = findViewById(R.id.btnLedOn);
+        Button btnLedOff  = findViewById(R.id.btnLedOff);
+
+        btnConnect.setOnClickListener(v -> connectMqtt());
+        btnArm.setOnClickListener(v -> publishCmd("ARM"));
+        btnDisarm.setOnClickListener(v -> publishCmd("DISARM"));
+        btnTest.setOnClickListener(v -> publishCmd("TEST"));
+        btnLedOn.setOnClickListener(v -> publishCmd("LEDON"));
+        btnLedOff.setOnClickListener(v -> publishCmd("LEDOFF"));
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        new Thread(() -> {
+            try {
+                if (client != null) {
+                    try { if (client.isConnected()) client.disconnect(); } catch (Exception ignored) {}
+                    try { client.close(); } catch (Exception ignored) {}
+                }
+            } catch (Exception ignored) {}
+        }).start();
+    }
+}
