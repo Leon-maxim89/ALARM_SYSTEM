@@ -1,0 +1,214 @@
+import usocket as socket
+import ustruct as struct
+
+class MQTTException(Exception):
+    pass
+
+def _encode_len(length):
+    out = bytearray()
+    while True:
+        digit = length % 128
+        length //= 128
+        if length > 0:
+            digit |= 0x80
+        out.append(digit)
+        if length == 0:
+            break
+    return out
+
+class MQTTClient:
+    def __init__(self, client_id, server, port=1883, user=None, password=None,
+                 keepalive=0, ssl=False, ssl_params=None):
+        self.client_id = client_id if isinstance(client_id, bytes) else client_id.encode()
+        self.server = server
+        self.port = port
+        self.user = user.encode() if isinstance(user, str) else user
+        self.pswd = password.encode() if isinstance(password, str) else password
+        self.keepalive = keepalive
+        self.ssl = ssl
+        self.ssl_params = ssl_params or {}
+        self.sock = None
+        self.cb = None
+        self.pid = 0
+
+    def set_callback(self, f):
+        self.cb = f
+
+    def _recv_len(self):
+        n = 0
+        sh = 0
+        while True:
+            b = self.sock.read(1)
+            if not b:
+                raise MQTTException("EOF")
+            b = b[0]
+            n |= (b & 0x7f) << sh
+            if not (b & 0x80):
+                return n
+            sh += 7
+
+    def connect(self, clean_session=True):
+        addr = socket.getaddrinfo(self.server, self.port)[0][-1]
+        s = socket.socket()
+        s.connect(addr)
+        if self.ssl:
+            import ussl
+            s = ussl.wrap_socket(s, **self.ssl_params)
+        self.sock = s
+
+        flags = 0
+        if clean_session:
+            flags |= 0x02
+        if self.user is not None:
+            flags |= 0x80
+        if self.pswd is not None:
+            flags |= 0x40
+
+        vh = bytearray()
+        vh.extend(b"\x00\x04MQTT")  # Protocol name
+        vh.append(4)               # Protocol level
+        vh.append(flags)           # Connect flags
+        vh.extend(struct.pack("!H", self.keepalive))
+
+        payload = bytearray()
+        payload.extend(struct.pack("!H", len(self.client_id)))
+        payload.extend(self.client_id)
+
+        if self.user is not None:
+            payload.extend(struct.pack("!H", len(self.user)))
+            payload.extend(self.user)
+        if self.pswd is not None:
+            payload.extend(struct.pack("!H", len(self.pswd)))
+            payload.extend(self.pswd)
+
+        rl = len(vh) + len(payload)
+        pkt = bytearray(b"\x10")
+        pkt.extend(_encode_len(rl))
+        pkt.extend(vh)
+        pkt.extend(payload)
+
+        self.sock.write(pkt)
+
+        resp = self.sock.read(4)
+        if resp is None or len(resp) != 4 or resp[0] != 0x20 or resp[1] != 0x02:
+            raise MQTTException("Bad CONNACK")
+        if resp[3] != 0:
+            raise MQTTException("CONNACK rc=%d" % resp[3])
+        return resp[2] & 1
+
+    def disconnect(self):
+        if self.sock:
+            try:
+                self.sock.write(b"\xe0\x00")
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+
+    def publish(self, topic, msg, retain=False, qos=0):
+        if isinstance(topic, str):
+            topic = topic.encode()
+        if isinstance(msg, str):
+            msg = msg.encode()
+
+        hdr = 0x30 | (qos << 1) | (1 if retain else 0)
+        pkt = bytearray([hdr])
+
+        vh = bytearray()
+        vh.extend(struct.pack("!H", len(topic)))
+        vh.extend(topic)
+
+        pid = None
+        if qos:
+            self.pid = (self.pid + 1) & 0xFFFF
+            if self.pid == 0:
+                self.pid = 1
+            pid = self.pid
+            vh.extend(struct.pack("!H", pid))
+
+        rl = len(vh) + len(msg)
+        pkt.extend(_encode_len(rl))
+        pkt.extend(vh)
+        pkt.extend(msg)
+        self.sock.write(pkt)
+        return pid
+
+    def subscribe(self, topic, qos=0):
+        if isinstance(topic, str):
+            topic = topic.encode()
+
+        self.pid = (self.pid + 1) & 0xFFFF
+        if self.pid == 0:
+            self.pid = 1
+
+        pkt = bytearray(b"\x82")
+
+        payload = bytearray()
+        payload.extend(struct.pack("!H", len(topic)))
+        payload.extend(topic)
+        payload.append(qos)
+
+        vh = struct.pack("!H", self.pid)
+
+        rl = len(vh) + len(payload)
+        pkt.extend(_encode_len(rl))
+        pkt.extend(vh)
+        pkt.extend(payload)
+        self.sock.write(pkt)
+
+        return self.pid
+
+    def wait_msg(self):
+        op = self.sock.read(1)
+        if not op:
+            return None
+        op = op[0]
+
+        
+        if op == 0xD0:
+            _ = self.sock.read(1)
+            return None
+
+        rl = self._recv_len()
+
+    
+        if (op & 0xF0) in (0x90, 0x40, 0x50, 0x70):
+            _ = self.sock.read(rl)
+            return None
+
+       
+        if (op & 0xF0) != 0x30:
+            _ = self.sock.read(rl)
+            return None
+
+        tlen = struct.unpack("!H", self.sock.read(2))[0]
+        topic = self.sock.read(tlen)
+
+        qos = (op >> 1) & 0x03
+        pid = None
+        if qos:
+            pid = self.sock.read(2)
+
+        msg_len = rl - 2 - tlen - (2 if qos else 0)
+        msg = self.sock.read(msg_len)
+
+        if self.cb:
+            self.cb(topic, msg)
+
+        
+        if qos == 1 and pid:
+            self.sock.write(b"\x40\x02" + pid)
+
+        return topic, msg
+
+    def check_msg(self):
+        self.sock.setblocking(False)
+        try:
+            return self.wait_msg()
+        except OSError:
+            return None
+        finally:
+            self.sock.setblocking(True)

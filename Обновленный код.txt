@@ -1,0 +1,205 @@
+import network, time
+from machine import Pin, PWM
+from umqtt_simple import MQTTClient
+
+try:
+    import ujson as json
+except ImportError:
+    import json  
+
+# ========== Wi-Fi (Wokwi) ==========
+WIFI_SSID = "Wokwi-GUEST"
+WIFI_PASS = ""
+
+# ========== MQTT ==========
+BROKER = "broker.emqx.io"
+PORT = 1883
+
+CLIENT_ID = "pico-wokwi-ctrl-001"  
+
+TOPIC_CMD   = b"pico/demo/cmd"     # Android -> Pico (команды)
+TOPIC_STATE = b"pico/demo/state"   # Pico -> Android (статус)
+TOPIC_EVENT = b"pico/demo/event"   # Pico -> Android (события)
+
+# ========== Пины (как у тебя) ==========
+pir_sensor   = Pin(15, Pin.IN)
+buzzer       = PWM(Pin(14))
+led          = Pin(13, Pin.OUT)
+slide_switch = Pin(16, Pin.IN, Pin.PULL_UP)   
+push_button  = Pin(17, Pin.IN, Pin.PULL_DOWN) 
+
+armed = False
+
+def buzzer_beep():
+    buzzer.freq(1000)
+    buzzer.duty_u16(30000)
+    time.sleep(0.2)
+    buzzer.duty_u16(0)
+
+def wifi_connect():
+    print("Подключение к Wi-Fi", end="")
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    wlan.connect(WIFI_SSID, WIFI_PASS)
+    t0 = time.ticks_ms()
+    while not wlan.isconnected():
+        if time.ticks_diff(time.ticks_ms(), t0) > 15000:
+            raise RuntimeError("Таймаут подключения к Wi-Fi")
+        print(".", end="")
+        time.sleep(0.1)
+    print(" Готово!")
+    print("Сеть:", wlan.ifconfig())
+
+def now_s():
+    try:
+        return int(time.time())
+    except:
+        return int(time.ticks_ms() // 1000)
+
+def publish_json(client, topic, obj):
+    try:
+        payload = json.dumps(obj).encode("utf-8")
+        client.publish(topic, payload)
+    except Exception as e:
+        print("Ошибка publish:", e)
+
+def publish_state(client, motion=0):
+    obj = {
+        "armed": 1 if armed else 0,
+        "switch": int(slide_switch.value()),  
+        "led": int(led.value()),
+        "motion": int(motion),
+        "ts": now_s()
+    }
+    publish_json(client, TOPIC_STATE, obj)
+
+def publish_event(client, event_text, extra=None):
+    obj = {
+        "event": event_text,  
+        "ts": now_s()
+    }
+    if extra is not None:
+        obj["extra"] = extra
+    publish_json(client, TOPIC_EVENT, obj)
+
+def mqtt_connect():
+    client = MQTTClient(CLIENT_ID, BROKER, port=PORT, keepalive=30)
+
+    def on_msg(topic, msg):
+        global armed
+        m = msg.strip().upper()
+        print("MQTT команда:", m)
+
+    
+
+        if m == b"ARM":
+            if slide_switch.value() == 1:
+                armed = True
+                publish_event(client, "Охрана включена")
+            else:
+                armed = False
+                publish_event(client, "Нельзя включить охрану: тумблер выключен")
+
+        elif m == b"DISARM":
+            armed = False
+            led.value(0)
+            buzzer.duty_u16(0)
+            publish_event(client, "Охрана выключена")
+
+        elif m == b"TEST":
+            led.value(1)
+            buzzer_beep()
+            led.value(0)
+            publish_event(client, "Тест выполнен (свет + звук)")
+
+        elif m == b"LEDON":
+            led.value(1)
+            publish_event(client, "Светодиод включён")
+
+        elif m == b"LEDOFF":
+            led.value(0)
+            publish_event(client, "Светодиод выключен")
+
+        elif m == b"STATUS":
+            publish_state(client, motion=1 if pir_sensor.value() else 0)
+            return
+
+        publish_state(client, motion=1 if pir_sensor.value() else 0)
+
+    client.set_callback(on_msg)
+    print("Подключение к MQTT...", BROKER)
+    client.connect()
+    client.subscribe(TOPIC_CMD)
+    print("MQTT подключен.", )
+    return client
+
+# ========== MAIN ==========
+wifi_connect()
+client = mqtt_connect()
+
+last_pub = time.ticks_ms()
+last_btn = time.ticks_ms()
+last_switch = slide_switch.value()
+
+print("Готово. Управление из Android.")
+
+while True:
+    try:
+        client.check_msg()
+    except Exception as e:
+        print("Ошибка MQTT:", e)
+        try:
+            client.disconnect()
+        except:
+            pass
+        time.sleep(1)
+        client = mqtt_connect()
+
+    # локальная кнопка — тест
+    if push_button.value() == 1 and time.ticks_diff(time.ticks_ms(), last_btn) > 500:
+        last_btn = time.ticks_ms()
+        print("Локальный тест: свет + звук")
+        led.value(1)
+        buzzer_beep()
+        led.value(0)
+        publish_event(client, "Локальный тест (кнопка)")
+
+    system_enabled = (slide_switch.value() == 1)
+    motion = 1 if pir_sensor.value() == 1 else 0
+
+    # смена тумблера
+    cur_sw = slide_switch.value()
+    if cur_sw != last_switch:
+        last_switch = cur_sw
+        if cur_sw == 1:
+            print("Тумблер: ВКЛ")
+            publish_event(client, "Тумблер включён")
+        else:
+            print("Тумблер: ВЫКЛ")
+            publish_event(client, "Тумблер выключен")
+
+    # если тумблер выключили во время охраны — автоотключение
+    if (not system_enabled) and armed:
+        armed = False
+        led.value(0)
+        buzzer.duty_u16(0)
+        print("Тумблер выключен → авто снятие с охраны")
+        publish_event(client, "Авто снятие с охраны: тумблер выключен")
+        publish_state(client, motion=motion)
+
+    # тревога только если тумблер ON и охрана включена
+    if system_enabled and armed and motion:
+        print("Движение обнаружено!")
+        led.value(1)
+        buzzer_beep()
+        time.sleep(0.3)
+        led.value(0)
+        publish_event(client, "Движение обнаружено!")
+        time.sleep(1.5)
+
+    # статус раз в ~2 сек
+    if time.ticks_diff(time.ticks_ms(), last_pub) > 2000:
+        last_pub = time.ticks_ms()
+        publish_state(client, motion=motion)
+
+    time.sleep(0.05)
